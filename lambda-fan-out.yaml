@@ -1,0 +1,839 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda fan-out concept
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Deployment
+        Parameters:
+          - MaxSimultaneousInvocationCount
+    ParameterLabels:
+      MaxSimultaneousInvocationCount:
+        default: Max Simultaneous Lambda Function Invocation Count
+
+Parameters:
+  MaxSimultaneousInvocationCount:
+    Type: Number
+    Description: The maximum number of times the processor function will be called for a single SNS publish.
+    Default: 512
+
+Mappings:
+  StaticVariables:
+    Main:
+      StageName: v1
+
+Resources:
+  
+  ApiGatewayLambdaInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: RoleActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  Fn::Sub: ${SnsNotificationHandlerFunction.Arn}
+  
+  MainApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name:
+        Fn::Sub: ${AWS::StackName}
+  
+  MainApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId:
+        Ref: MainApi
+      StageName: dummy
+    DependsOn:
+      - LambdaInvokeProxyMethod
+  
+  MainApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId:
+        Ref: MainApiDeployment
+      RestApiId:
+        Ref: MainApi
+      StageName:
+        Fn::FindInMap:
+          - StaticVariables
+          - Main
+          - StageName
+  
+  LambdaEndpointsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId:
+        Fn::Sub: ${MainApi.RootResourceId}
+      PathPart: 'lambda'
+      RestApiId:
+        Ref: MainApi
+  
+  LambdaInvokeProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Credentials:
+          Fn::Sub: ${ApiGatewayLambdaInvokeRole.Arn}
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              text/plain:
+                Fn::Sub: |-
+                  {
+                    "message": "Lambda function ${SnsNotificationHandlerFunction.Arn} invoked successfully."
+                  }
+          - StatusCode: 400
+            SelectionPattern: 400
+          - StatusCode: 413
+            SelectionPattern: 413
+          - StatusCode: 415
+            SelectionPattern: 415
+          - StatusCode: 429
+            SelectionPattern: 429
+          - StatusCode: 500
+            SelectionPattern: 500
+          - StatusCode: 502
+            SelectionPattern: 502
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/json'"
+          integration.request.header.X-Amz-Invocation-Type: "'Event'"
+          integration.request.header.X-Amz-Client-Context:
+            Fn::Sub:
+              - "'${HeaderContent}'"
+              - HeaderContent:
+                  Fn::Base64:
+                    Fn::Sub: |-
+                      {"stack-id": "${AWS::StackId}"}
+        RequestTemplates:
+          text/plain: |-
+            $input.body
+        Type: AWS
+        Uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SnsNotificationHandlerFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+        - StatusCode: 413
+        - StatusCode: 415
+        - StatusCode: 429
+        - StatusCode: 500
+        - StatusCode: 502
+      ResourceId:
+        Ref: LambdaEndpointsResource
+      RestApiId:
+        Ref: MainApi
+  
+  SnsTopicPreloaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Preloads SNS topic subscriptions as a CloudFormation custom resource.
+      Handler: index.lambda_handler
+      MemorySize: 1536
+      Role:
+        Fn::Sub: ${SnsTopicPreloaderFunctionRole.Arn}
+      Code:
+        ZipFile:
+          Fn::Sub: |-
+            import json
+            import threading
+            import boto3
+
+            sns_client = boto3.client("sns")
+            subs_by_topic_paginator = sns_client.get_paginator("list_subscriptions_by_topic")
+            max_threads = 10
+
+            multithread_results_dict = {}
+
+            def lambda_handler(event, context):
+    
+                print("Event: {}".format(json.dumps(event)))
+    
+                multithread_results_dict.clear()
+
+                requested_count = event["SimultaneousInvocationCount"]
+                sns_topic_arn = event["SnsTopicArn"]
+                rest_api_base_url = event["RestApiBaseUrl"]
+
+                response_iterator = subs_by_topic_paginator.paginate(
+                    TopicArn = sns_topic_arn
+                )
+
+                existing_subs = []
+
+                for each_response in response_iterator:
+                    for each_sub in each_response.get("Subscriptions", []):
+                        if each_sub["Endpoint"].startswith(rest_api_base_url):
+                            existing_subs.append(each_sub)
+
+                print("Found {} existing subscription(s).".format(len(existing_subs)))
+
+                thread_ops = []
+
+                if len(existing_subs) > requested_count:
+
+                    i = len(existing_subs)
+                    while i > requested_count:
+                        del_sub_url = "{}?Sub={}".format(rest_api_base_url, i)
+
+                        sub_deleted = False
+                        for each_sub in existing_subs:
+                            if each_sub["Endpoint"] == del_sub_url:
+                                sub_arn = each_sub["SubscriptionArn"]
+
+                                thread_ops.append({
+                                    "action": "unsub",
+                                    "arn": sub_arn
+                                })
+
+                                sub_deleted = True
+                                break
+
+                        if not sub_deleted:
+                            print("WARNING: Subscription numbering scheme off. Unable to find expected subscription to delete.")
+
+                        i -= 1
+
+                else:
+                    count_offset = len(existing_subs) + 1
+
+                    i = len(existing_subs)
+                    while i < requested_count:
+                        new_sub_url = "{}?Sub={}".format(rest_api_base_url, i+1)
+
+                        thread_ops.append({
+                            "action": "sub",
+                            "url": new_sub_url
+                        })
+
+                        i += 1
+
+                thread_groups = []
+
+                this_thread_list = None
+                for i, each_op in enumerate(thread_ops):
+                    if i % max_threads == 0:
+                        if this_thread_list is not None:
+                            thread_groups.append(this_thread_list)
+                        this_thread_list = []
+
+                    this_thread_list.append(threading.Thread(
+                        target=do_thread_op,
+                        args=(sns_topic_arn, each_op,)
+                    ))
+
+                if this_thread_list is not None and len(this_thread_list):
+                    thread_groups.append(this_thread_list)
+
+                for each_group in thread_groups:
+                    for t in each_group:
+                        t.start()
+                    for t in each_group:
+                        t.join()
+    
+                error_count = multithread_results_dict.get("errors", 0)
+    
+                if error_count > 0:
+                    raise Exception("Subscription / unsubscription operations encountered {} error(s).".format(
+                        error_count
+                    ))
+    
+                return {
+                    "message": "SNS topic subscriptions preloaded successfully."
+                }
+
+            def do_thread_op(sns_topic_arn, op_dict):
+    
+                try:
+                    if op_dict["action"] == "unsub":
+                        print("Unsubscribing {}".format(op_dict["arn"]))
+                        sns_client.unsubscribe(
+                            SubscriptionArn = op_dict["arn"]
+                        )
+                    elif op_dict["action"] == "sub":
+                        print("Subscribing {}".format(op_dict["url"]))
+                        sns_client.subscribe(
+                            TopicArn = sns_topic_arn,
+                            Protocol = "https",
+                            Endpoint = op_dict["url"]
+                        )
+                except:
+                    multithread_results_dict["errors"] = multithread_results_dict.get("errors", 0) + 1
+                    raise
+          
+      Runtime: python3.6
+      Timeout: 300
+  
+  SnsTopicPreloaderFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: RoleActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+              - Effect: Allow
+                Action:
+                  - sns:ListSubscriptionsByTopic
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                Resource:
+                  Fn::Sub: arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-*
+  
+  SnsTopicPreloaderFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${SnsTopicPreloaderFunction}
+  
+  SnsTopicCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Creates SNS topics as a CloudFormation custom resource.
+      Handler: index.lambda_handler
+      MemorySize: 1536
+      Role:
+        Fn::Sub: ${SnsTopicCreatorFunctionRole.Arn}
+      Code:
+        ZipFile:
+          Fn::Sub: |-
+            import os
+            import json
+            import uuid
+            import math
+            import boto3
+            import botocore
+            import cfnresponse
+
+            sns_client = boto3.client("sns")
+            lambda_client = boto3.client("lambda")
+
+            def lambda_handler(event, context):
+                print("Event: {}".format(json.dumps(event)))
+
+                physical_resource_id = event.get("PhysicalResourceId", str(uuid.uuid4()))
+
+                try:
+                    return_dict = handle_event(event, physical_resource_id)
+                except:
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {}, physical_resource_id)
+                    raise
+
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, return_dict, physical_resource_id)
+
+            def handle_event(event, physical_resource_id):
+                stack_name = event["StackId"].split(":")[-1].split("/")[1]
+                max_count = int(event["ResourceProperties"]["MaxSimultaneousInvocationCount"])
+                rest_api_base_url = event["ResourceProperties"]["RestApiBaseUrl"]
+
+                sns_topic_name_list = []
+                i = 0
+                last_count = 0
+
+                while max_count > 0 and last_count < max_count:
+
+                    last_count = int(math.pow(2, i))
+                    if last_count <= max_count:
+                        sns_topic_name = "{}-MultiInvoke-{}".format(stack_name, last_count)
+                        sns_topic_name_list.append(sns_topic_name)
+
+                    i += 1
+
+                if event["RequestType"] == "Delete":
+
+                    for each_sns_topic_name in sns_topic_name_list:
+                        sns_topic_arn = "arn:aws:sns:{region}:{account_id}:{topic_name}".format(
+                            region=event["ServiceToken"].split(":")[3],
+                            account_id=event["ServiceToken"].split(":")[4],
+                            topic_name=each_sns_topic_name
+                        )
+                        print("Deleting {}.".format(sns_topic_arn))
+
+                        sns_client.delete_topic(
+                            TopicArn=sns_topic_arn
+                        )
+
+                    return {}
+    
+                sns_topic_name_list.reverse()
+    
+                sns_topic_arn_list = []
+
+                for each_sns_topic_name in sns_topic_name_list:
+        
+                    print("Creating topic: {}".format(each_sns_topic_name))
+        
+                    response = sns_client.create_topic(
+                        Name=each_sns_topic_name
+                    )
+
+                    sns_topic_arn = response["TopicArn"]
+        
+                    print("Setting topic policy: {}".format(each_sns_topic_name))
+
+                    sns_client.set_topic_attributes(
+                        TopicArn=sns_topic_arn,
+                        AttributeName="Policy",
+                        AttributeValue=get_sns_topic_policy_string(sns_topic_arn)
+                    )
+        
+                    print("Invoking preloader function: {}".format(each_sns_topic_name))
+        
+                    response = lambda_client.invoke(
+                        FunctionName=os.environ["PRELOADER_FUNCTION_ARN"],
+                        Payload=json.dumps({
+                            "SnsTopicArn": sns_topic_arn,
+                            "SimultaneousInvocationCount": int(each_sns_topic_name.split("-")[-1]),
+                            "RestApiBaseUrl": rest_api_base_url
+                        }).encode("utf-8")
+                    )
+        
+                    if "FunctionError" in response:
+                        print("Error response: {}".format(
+                            response["Payload"].read().decode("utf-8")
+                        ))
+                        raise Exception("Error received from preloader function ARN.")
+
+                    sns_topic_arn_list.append(sns_topic_arn)
+
+                return {
+                    "TopicArns": sns_topic_arn_list
+                }
+
+            def get_sns_topic_policy_string(sns_topic_arn):
+                return json.dumps({
+                    "Version": "2008-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "AllowSubscriptionByPreloader",
+                            "Effect": "Allow",
+                            "Action": [
+                                "sns:ListSubscriptionsByTopic",
+                                "sns:Subscribe"
+                            ],
+                            "Principal": {
+                                "AWS": os.environ["PRELOADER_IAM_ROLE_ARN"]
+                            },
+                            "Resource": sns_topic_arn
+                        },
+                        {
+                            "Sid": "AllowPublishByMultiInvoker",
+                            "Effect": "Allow",
+                            "Action": "sns:Publish",
+                            "Principal": {
+                                "AWS": os.environ["MULTI_INVOKER_IAM_ROLE_ARN"]
+                            },
+                            "Resource": sns_topic_arn
+                        }
+                    ]
+                })
+      Environment:
+        Variables:
+          MULTI_INVOKER_IAM_ROLE_ARN:
+            Fn::Sub: ${MultiLambdaInvokerFunctionRole.Arn}
+          PRELOADER_FUNCTION_ARN:
+            Fn::Sub: ${SnsTopicPreloaderFunction.Arn}
+          PRELOADER_IAM_ROLE_ARN:
+            Fn::Sub: ${SnsTopicPreloaderFunctionRole.Arn}
+      Runtime: python3.6
+      Timeout: 300
+  
+  SnsTopicCreatorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: RoleActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+              - Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:SetTopicAttributes
+                  - sns:DeleteTopic
+                Resource:
+                  Fn::Sub: arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-MultiInvoke-*
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  Fn::Sub: ${SnsTopicPreloaderFunction.Arn}
+  
+  SnsTopicCreatorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${SnsTopicCreatorFunction}
+  
+  SnsTopicCreation:
+    Type: Custom::SnsTopicCreation
+    Properties:
+      ServiceToken:
+        Fn::Sub: ${SnsTopicCreatorFunction.Arn}
+      RestApiBaseUrl:
+        Fn::Sub:
+          - https://${MainApi}.execute-api.${AWS::Region}.amazonaws.com/${MainStageName}/lambda
+          - MainStageName:
+              Fn::FindInMap:
+              - StaticVariables
+              - Main
+              - StageName
+      MaxSimultaneousInvocationCount:
+        Ref: MaxSimultaneousInvocationCount
+    DependsOn:
+      - SnsTopicPreloaderFunctionLogGroup
+      - SnsNotificationHandlerFunctionLogGroup
+      - SnsTopicCreatorFunctionLogGroup
+      - MainApiStage
+  
+  MultiLambdaInvokerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Invokes a Lambda function an arbitrary number of times.
+      Handler: index.lambda_handler
+      MemorySize: 1536
+      Role:
+        Fn::Sub: ${MultiLambdaInvokerFunctionRole.Arn}
+      Code:
+        ZipFile:
+          Fn::Sub: |-
+            import os
+            import json
+            import math
+            import boto3
+            import botocore
+
+            stack_name = os.environ["STACK_NAME"]
+
+            sns_client = boto3.client("sns")
+
+            def lambda_handler(event, context):
+                print("Event: {}".format(json.dumps(event)))
+    
+                max_count = event["InvocationCount"]
+                if max_count <= 0:
+                    raise Exception("InvocationCount must be greater than zero.")
+    
+                payload = event.get("Payload", "{}")
+    
+                topic_subs_counts = []
+                i = 0
+                last_count = 0
+    
+                while max_count > 0 and last_count < max_count:
+
+                    last_count = int(math.pow(2, i))
+                    if last_count <= max_count:
+                        topic_subs_counts.append(last_count)
+                    i += 1
+    
+                topic_subs_counts.reverse()
+    
+                topic_counts_to_use = []
+    
+                remaining_count = max_count
+                for each_sub_count in topic_subs_counts:
+                    if each_sub_count <= remaining_count:
+                        topic_counts_to_use.append(each_sub_count)
+                        remaining_count -= each_sub_count
+    
+                print("Topic counts to use: {}".format(json.dumps(topic_counts_to_use)))
+                
+                invocations_made = 0
+                
+                for each_topic_count in topic_counts_to_use:
+                    invocations_made += each_topic_count
+                    sns_topic_name = "{}-MultiInvoke-{}".format(stack_name, each_topic_count)
+                    sns_topic_arn = "arn:aws:sns:{region}:{account_id}:{topic_name}".format(
+                        region=context.invoked_function_arn.split(":")[3],
+                        account_id=context.invoked_function_arn.split(":")[4],
+                        topic_name=sns_topic_name
+                    )
+        
+                    print("Publishing to SNS topic: {}".format(sns_topic_arn))
+        
+                    response = sns_client.publish(
+                        TopicArn=sns_topic_arn,
+                        Message=payload
+                    )
+                
+                return {
+                    "message": "Invocation(s) ({}) submitted.".format(invocations_made)
+                }
+      Environment:
+        Variables:
+          STACK_NAME:
+            Ref: AWS::StackName
+      Runtime: python3.6
+      Timeout: 300
+  
+  MultiLambdaInvokerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: RoleActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+  
+  MultiLambdaInvokerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${MultiLambdaInvokerFunction}
+  
+  SnsNotificationHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Handles received SNS notifications.
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::Sub: ${SnsNotificationHandlerFunctionRole.Arn}
+      Code:
+        ZipFile:
+          Fn::Sub: |-
+            import os
+            import json
+            import base64
+            import urllib.request
+            import tempfile
+            import subprocess
+            import shutil
+            
+            aws_account_id = "${AWS::AccountId}"
+            
+            def lambda_handler(event, context):
+                print("Event: {}".format(json.dumps(event)))
+                
+                sns_notification_dict = event
+                
+                print("SNS Notification: {}".format(json.dumps(sns_notification_dict)))
+    
+                validate_sns_message(sns_notification_dict)
+                print("SNS signature validated.")
+                
+                sns_topic_account_id = sns_notification_dict["TopicArn"].split(":")[4]
+                if sns_topic_account_id != aws_account_id:
+                    raise Exception("SNS notification from unexpected AWS account.")
+    
+                notification_type = sns_notification_dict["Type"]
+    
+                if notification_type == "SubscriptionConfirmation":
+                    print("Confirming subscription.")
+                    subscribe_url = sns_notification_dict["SubscribeURL"]
+                    f = urllib.request.urlopen(subscribe_url)
+                    if f.status < 200 or f.status > 299:
+                        raise Exception("Unexpected status code received in confirming subscription: {}".format(f.status))
+                    print("Subscription confirmed.")
+                elif notification_type == "Notification":
+                    message_text = sns_notification_dict["Message"]
+                    print("Should process notification: {}".format(message_text))
+
+            def validate_sns_message(sns_notification_dict):
+                notification_type = sns_notification_dict["Type"]
+                decoded_signature_bytes = base64.b64decode(sns_notification_dict["Signature"])
+    
+                signature_keys_list = []
+                if notification_type == "Notification":
+                    signature_keys_list.extend([
+                        "Message",
+                        "MessageId",
+                        "Subject",
+                        "Timestamp",
+                        "TopicArn",
+                        "Type"
+                    ])
+                elif notification_type in ["SubscriptionConfirmation", "UnsubscribeConfirmation"]:
+                    signature_keys_list.extend([
+                        "Message",
+                        "MessageId",
+                        "SubscribeURL",
+                        "Timestamp",
+                        "Token",
+                        "TopicArn",
+                        "Type"
+                    ])
+                else:
+                    raise Exception("Unable to validate SNS notification signature. Unexpected type: {}".format(notification_type))
+    
+                signature_cert_url = sns_notification_dict["SigningCertURL"]
+    
+                f = urllib.request.urlopen(signature_cert_url)
+                signature_cert_bytes = f.read()
+    
+                canonical_string = ""
+                for each_key in signature_keys_list:
+                    if each_key not in sns_notification_dict:
+                        continue
+                    canonical_string += each_key + "\n" + sns_notification_dict[each_key] + "\n"
+    
+                cert_file = tempfile.NamedTemporaryFile(delete=False)
+                cert_file.write(signature_cert_bytes)
+                cert_file.close()
+                signing_content_file = tempfile.NamedTemporaryFile(delete=False)
+                signing_content_file.write(canonical_string.encode("utf-8"))
+                signing_content_file.close()
+                signature_file = tempfile.NamedTemporaryFile(delete=False)
+                signature_file.write(decoded_signature_bytes)
+                signature_file.close()
+    
+                p = subprocess.run(
+                    [
+                        "openssl",
+                        "x509",
+                        "-pubkey",
+                        "-noout",
+                        "-in",
+                        cert_file.name
+                    ],
+                    stdout=subprocess.PIPE
+                )
+    
+                os.unlink(cert_file.name)
+    
+                if p.returncode != 0:
+                    os.unlink(signature_file.name)
+                    os.unlink(signing_content_file.name)
+                    os.unlink(pubkey_file.name)
+                    raise Exception("Non-zero exit code extracting public key from cert.")
+    
+                pubkey_file = tempfile.NamedTemporaryFile(delete=False)
+                pubkey_file.write(p.stdout)
+                pubkey_file.close()
+    
+                p = subprocess.run(
+                    [
+                        "openssl",
+                        "dgst",
+                        "-verify",
+                        pubkey_file.name,
+                        "-signature",
+                        signature_file.name,
+                        signing_content_file.name
+                    ]
+                )
+    
+                os.unlink(signature_file.name)
+                os.unlink(signing_content_file.name)
+                os.unlink(pubkey_file.name)
+    
+                if p.returncode != 0:
+                    raise Exception("Unable to validate message signature.")
+              
+      Runtime: python3.6
+      Timeout: 300
+  
+  SnsNotificationHandlerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: RoleActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+  
+  SnsNotificationHandlerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${SnsNotificationHandlerFunction}
+
+Outputs:
+  MultiLambdaInvokerFunction:
+    Description: |-
+      The function to call to invoke the processor function an arbitrary number of times.
+    Value:
+      Ref: MultiLambdaInvokerFunction
+  SnsNotificationHandlerFunction:
+    Description: |-
+      The function that will be invoked many times.
+    Value:
+      Ref: SnsNotificationHandlerFunction
+  

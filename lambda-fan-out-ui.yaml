@@ -1,0 +1,438 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Basic web interface for Lambda fan out concept
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Deployment
+        Parameters:
+          - MaxSimultaneousInvocationCount
+    ParameterLabels:
+      MaxSimultaneousInvocationCount:
+        default: Max Simultaneous Lambda Function Invocation Count
+
+Parameters:
+  MaxSimultaneousInvocationCount:
+    Type: Number
+    Description: The maximum number of times the processor function will be called for a single SNS publish.
+    Default: 512
+
+Mappings:
+  StaticVariables:
+    Main:
+      BaseStackBucket: bennlinger-public
+      BaseStackKey: lambda-fan-out-concept-20170616/lambda-fan-out.yaml
+      StageName: v1
+
+Conditions:
+  FalseCondition:
+    Fn::Equals:
+      - 'Yes'
+      - 'No'
+
+Resources:
+  
+  BaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        MaxSimultaneousInvocationCount:
+          Ref: MaxSimultaneousInvocationCount
+      TemplateURL:
+        Fn::Sub:
+          - https://s3.amazonaws.com/${BaseStackBucket}/${BaseStackKey}
+          - BaseStackBucket:
+              Fn::FindInMap:
+                - StaticVariables
+                - Main
+                - BaseStackBucket
+            BaseStackKey:
+              Fn::FindInMap:
+                - StaticVariables
+                - Main
+                - BaseStackKey
+
+  
+  WebInterfaceApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name:
+        Fn::Sub: ${AWS::StackName}
+  
+  WebInterfaceApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId:
+        Ref: WebInterfaceApi
+      StageName: dummy
+    DependsOn:
+      - RootGetMethod
+  
+  WebInterfaceApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId:
+        Ref: WebInterfaceApiDeployment
+      RestApiId:
+        Ref: WebInterfaceApi
+      StageName:
+        Fn::FindInMap:
+          - StaticVariables
+          - Main
+          - StageName
+  
+  RootGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Content-Type: "'text/html'"
+            ResponseTemplates:
+              text/html:
+                Fn::Sub: |-
+                  <!DOCTYPE HTML>
+                  <html>
+                  <head>
+                    <title>Lambda Fan-Out Proof of Concept</title>
+                    <meta charset="utf-8" />
+                  	<meta name="viewport" content="width=device-width, initial-scale=1" />
+                  	<meta http-equiv="Content-Language" content="en">
+                  	<meta name="google" content="notranslate" />
+                    <script src="https://sdk.amazonaws.com/js/aws-sdk-2.71.0.min.js"></script>
+                    <style type="text/css">
+                      body {
+                        font-family: "Source Sans Pro", Helvetica, sans-serif;
+                        margin-left: 16px;
+                        margin-right: 16px;
+                      }
+                      #js-show, #invoke-in-progress {
+                        display: none;
+                      }
+                      #payload-content {
+                        width: 300px;
+                      }
+                      #invoke-button {
+                        font-size: 200%;
+                      }
+                      #invoke-wrapper {
+                        margin-top: 20px;
+                        margin-left: 20px;
+                        min-height: 50px;
+                      }
+                      #cloudwatch-wrapper {
+                        margin-top: 30px;
+                      }
+                      .body-detail1 {
+                        margin-bottom: 5px;
+                        margin-left: 10px;
+                      }
+                    </style>
+                    <script type="text/javascript">
+                      var awsRegion = "${AWS::Region}";
+                      var maxInvocationCount = "${MaxSimultaneousInvocationCount}";
+                      var awsAccessKeyId = "${WebInterfaceUserAccessKey}";
+                      var awsSecretAccessKeyId = "${WebInterfaceUserAccessKey.SecretAccessKey}";
+                      var invokerFunctionName = "${BaseStack.Outputs.MultiLambdaInvokerFunction}";
+                      var processorFunctionName = "${BaseStack.Outputs.SnsNotificationHandlerFunction}";
+    
+                      AWS.config.update({region: awsRegion});
+                      AWS.config.apiVersions = {
+                        cloudwatch: '2010-08-01',
+                        cloudwatchlogs: '2014-03-28',
+                        lambda: '2015-03-31'
+                      };
+    
+                      AWS.config.credentials = new AWS.Credentials(
+                        accessKeyId = awsAccessKeyId,
+                        secretAccessKey = awsSecretAccessKeyId
+                      );
+    
+                      var cloudwatch = new AWS.CloudWatch();
+                      var cloudwatchlogs = new AWS.CloudWatchLogs();
+                      var lambda = new AWS.Lambda();
+    
+                      var invokeButtonPressed = function() {
+      
+                        var invocationCount = parseInt(document.getElementById("invoke-count").value);
+      
+                        var payloadObject = {
+                          "InvocationCount": invocationCount,
+                          "Payload": document.getElementById("payload-content").value
+                        }
+      
+                        var invokeParams = {
+                          FunctionName: invokerFunctionName,
+                          Payload: JSON.stringify(payloadObject)
+                        };
+      
+                        var invokeButton = document.getElementById("invoke-button");
+                        var invokeInProgressSpan = document.getElementById("invoke-in-progress");
+      
+                        invokeButton.style.display = "none";
+                        invokeInProgressSpan.style.display = "inherit";
+      
+                        lambda.invoke(invokeParams, function(err, data) {
+                          invokeButton.style.display = "inherit";
+                          invokeInProgressSpan.style.display = "none";
+        
+                          if (err) {
+                            console.log(err, err.stack);
+                            alert("An error occurred in performing the invocation. Check your browser's console for details.");
+                          }
+                          else {
+                            document.getElementById("result-message").innerHTML = data.Payload
+                            console.log(data);
+                          }
+                        });
+      
+                        return false;
+                      }
+    
+                      var refreshCloudWatchMetricData = function() {
+      
+                        var currentDate = new Date();
+    
+                        var endDate = new Date();
+                        endDate.setMinutes(currentDate.getMinutes() + 1);
+    
+                        var startDate = new Date();
+                        startDate.setMinutes(currentDate.getMinutes() - 5);
+      
+                        // Fetch number of log streams.
+      
+                        var logStreamCountDiv = document.getElementById("cw-log-stream-count");
+      
+      
+      
+                        var logStreamCount = 0;
+      
+      
+                        var fetchMoreLogStreams = function(nextToken) {
+                          var params = {
+                            logGroupName: "/aws/lambda/" + processorFunctionName,
+                            descending: true,
+                            orderBy: "LastEventTime"
+                          }
+                          if (nextToken !== undefined) {
+                            params["nextToken"] = nextToken;
+                          }
+        
+                          cloudwatchlogs.describeLogStreams(params, function(err, data) {
+                            if (err) {
+                              logStreamCountDiv.innerHTML = "...error";
+                              console.log(err, err.stack);
+                            }
+                            else {
+            
+                              var finished = false;
+            
+                              for (var i=0; i < data.logStreams.length; i++) {
+                                var eachStream = data.logStreams[i];
+                                var lastIngestionTime = new Date(eachStream.lastIngestionTime);
+                                var lastEventTime = new Date(eachStream.lastEventTimestamp);
+                                if (lastIngestionTime < startDate && lastEventTime < startDate) {
+                                  finished = true;
+                                  break;
+                                }
+                                else {
+                                  logStreamCount += 1;
+                                }
+                              }
+          
+                              if ((!finished) && data.hasOwnProperty("nextToken")) {
+                                fetchMoreLogStreams(data.nextToken);
+                              }
+                              else {
+                                logStreamCountDiv.innerHTML = logStreamCount;
+                              }
+                            }
+                          });
+                        }
+      
+                        logStreamCountDiv.innerHTML = "...";
+                        fetchMoreLogStreams();
+      
+                        // Fetch CloudWatch metrics.
+      
+                        var metricDivItems = [
+                          {
+                            "metric": "Invocations",
+                            "div": "cw-invocation-count"
+                          },
+                          {
+                            "metric": "Throttles",
+                            "div": "cw-throttle-count"
+                          }
+                        ]
+      
+                        for (var j=0; j < metricDivItems.length; j++) {
+                          var thisRequestItem = metricDivItems[j];
+      
+                          var params = {
+                            EndTime: endDate,
+                            StartTime: startDate,
+                            MetricName: thisRequestItem["metric"],
+                            Namespace: "AWS/Lambda",
+                            Period: 60,
+                            Dimensions: [
+                              {
+                                Name: "FunctionName",
+                                Value: processorFunctionName
+                              }
+                            ],
+                            Statistics: [
+                              "Sum"
+                            ],
+                            Unit: "Count"
+                          };
+        
+                          (function() {
+                            var thisDiv = document.getElementById(thisRequestItem["div"]);
+        
+                            thisDiv.innerHTML = "...";
+        
+                            cloudwatch.getMetricStatistics(params, function(err, data) {
+                              if (err) {
+                                thisDiv.innerHTML = "...error";
+                                console.log(err, err.stack);
+                              }
+                              else {
+                                var totalCount = 0;
+          
+                                for (var i=0; i < data.Datapoints.length; i++) {
+                                  var thisDataPoint = data.Datapoints[i];
+                                  totalCount += thisDataPoint.Sum;
+                                }
+          
+                                thisDiv.innerHTML = totalCount;
+                              }
+                            });
+                          })();
+                        }
+      
+      
+      
+                      }
+    
+                    </script>
+                  </head>
+                  <body>
+                    <h1>Lambda Fan-Out Proof of Concept</h1>
+                    <noscript>JavaScript must be enabled to use this.</noscript>
+                    <div id="js-show">
+                      <div class="body-detail1">
+                        <strong>Target Lambda function:</strong>
+                        <span id="invoke-function-name"></span>
+                      </div>
+                      <div class="body-detail1">
+                        <strong>Number of times:</strong>
+                        <input id="invoke-count" type="text" value="" pattern="\d*">
+                      </div>
+                      <div class="body-detail1">
+                        <strong>Payload:</strong>
+                        <input id="payload-content" type="text" value="Hello from demo web page!">
+                      </div>
+                      <div id="invoke-wrapper" class="body-detail1">
+                        <button onclick="return invokeButtonPressed();" id="invoke-button">Invoke</button>
+                        <span id="invoke-in-progress">Sending request...</span>
+                      </div>
+                      <div id="result-message" class="body-detail1"></div>
+                      <div id="cloudwatch-wrapper">
+                        <h3>CloudWatch statistics*</h3>
+                        <div class="body-detail1">
+                          <strong>Invocations in the last five minutes:</strong>
+                          <span id="cw-invocation-count">...</span>
+                        </div>
+                        <div class="body-detail1">
+                          <strong>Throttles in the last five minutes:</strong>
+                          <span id="cw-throttle-count">...</span>
+                        </div>
+                        <div class="body-detail1">
+                          <strong>Distinct log streams active in the last five minutes:</strong>
+                          <span id="cw-log-stream-count">...</span>
+                        </div>
+      
+                        <p>
+                          * This data is eventually consistent.
+                        </p>
+                        <p>
+                          Check the function's <a href="" id="cw-log-group-link" onclick="window.open(this.href); return false;">CloudWatch log group</a> to verify concurrency.
+                        </p>
+                      </div>
+                    </div>
+                    <script type="text/javascript">
+                      document.getElementById("js-show").style.display = "block";
+    
+                      var viewFunctionUrl = "https://console.aws.amazon.com/lambda/home?region=" + awsRegion + "#/functions/" + processorFunctionName + "?tab=code";
+    
+                      document.getElementById("invoke-function-name").innerHTML = '<a href="' + viewFunctionUrl + '" onclick="window.open(this.href); return false;">' + processorFunctionName + '</a>';
+                      document.getElementById("invoke-count").value = maxInvocationCount;
+    
+                      var viewStreamsUrl = "https://console.aws.amazon.com/cloudwatch/home?region=" + awsRegion + "#logStream:group=/aws/lambda/" + processorFunctionName + ";streamFilter=typeLogStreamPrefix";
+    
+                      document.getElementById("cw-log-group-link").setAttribute("href", viewStreamsUrl);
+    
+                      refreshCloudWatchMetricData();
+    
+                      setInterval(refreshCloudWatchMetricData, 10000);
+                    </script>
+                  </body>
+                  </html>
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Content-Type: true
+      ResourceId:
+        Fn::Sub: ${WebInterfaceApi.RootResourceId}
+      RestApiId:
+        Ref: WebInterfaceApi
+  
+  WebInterfaceUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: UserActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  Fn::Sub: arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BaseStack.Outputs.MultiLambdaInvokerFunction}
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                Resource:
+                  Fn::Sub: 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${BaseStack.Outputs.SnsNotificationHandlerFunction}:log-stream:'
+  
+  WebInterfaceUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName:
+        Ref: WebInterfaceUser
+  
+Outputs:
+  DemoUrl:
+    Value:
+      Fn::Sub:
+        - https://${WebInterfaceApi}.execute-api.${AWS::Region}.amazonaws.com/${MainStageName}/
+        - MainStageName:
+            Fn::FindInMap:
+            - StaticVariables
+            - Main
+            - StageName
