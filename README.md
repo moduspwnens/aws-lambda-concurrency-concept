@@ -16,6 +16,12 @@ Simply click "Next" until you get to the **Review** page, then check the box for
 
 The stack is now being created. It typically takes 5-7 minutes to finish. Use the refresh button (⟳) to check on it periodically. Once it reaches a **CREATE_COMPLETE** state, it's ready to go! Simply select the stack, click the *Outputs* tab, and click the link next to the one called **DemoUrl**.
 
+### What It Does
+
+You'll see a basic web page that lets you specify the number of invocations to make and the payload. Click the **Invoke** button to submit the invocation request.
+
+The significance is that despite making only a single API request, hundreds or thousands of invocations of the function are triggered. This makes it far easier to (for example) process an SQS queue with millions of items, as you can execute as many concurrent Lambda invocations as are necessary.
+
 ### Destroy
 
 To delete all the resources, simply delete the stack.
